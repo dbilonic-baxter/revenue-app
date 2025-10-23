@@ -33,6 +33,19 @@ def resolve_support_file(uploaded, fallback_filename):
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
 REQUIRED_SUPPORT = ["Parts.xlsx", "revenue_type.xlsx", "lookup_gl.xlsx"]
 
 def find_support_dir(team_subpath: str) -> Path | None:
@@ -188,6 +201,7 @@ elif choice == "NC 100% Revenue":
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         use_container_width=True
                     )
+
 
 
 elif choice == "NC Partial Revenue":
