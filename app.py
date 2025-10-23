@@ -1,6 +1,38 @@
 import os, shutil
 from pathlib import Path
 
+import io
+import pathlib
+import streamlit as st
+import pandas as pd
+
+HERE = pathlib.Path(__file__).parent
+
+@st.cache_data(show_spinner=False)
+def load_excel_df(src, *, sheet_name=0, header=0):
+    """src can be an UploadedFile, bytes, path-like, or file-like."""
+    if hasattr(src, "read"):           # UploadedFile / file-like
+        return pd.read_excel(src, engine="openpyxl", sheet_name=sheet_name, header=header)
+    src = pathlib.Path(src)
+    with src.open("rb") as f:
+        return pd.read_excel(f, engine="openpyxl", sheet_name=sheet_name, header=header)
+
+def resolve_support_file(uploaded, fallback_filename):
+    """Return a file-like object for pandas: uploaded if present, else repo file."""
+    if uploaded is not None:
+        # Make an in-memory copy so cached readers can re-use it
+        return io.BytesIO(uploaded.getbuffer())
+    # Fall back to file shipped in the repo
+    fallback_path = HERE / fallback_filename
+    if not fallback_path.exists():
+        raise FileNotFoundError(f"Missing required support file: {fallback_filename}")
+    return fallback_path
+
+
+
+
+
+
 REQUIRED_SUPPORT = ["Parts.xlsx", "revenue_type.xlsx", "lookup_gl.xlsx"]
 
 def find_support_dir(team_subpath: str) -> Path | None:
@@ -61,124 +93,203 @@ def timestamped_filename(base_name: str) -> str:
     name, ext = os.path.splitext(base_name)
     return f"{name}_{ts}{ext}"
 
-# =========================
-# NC 100% Revenue (UNCHANGED)
-# =========================
-if choice == "NC 100% Revenue":
-    ab_file = st.file_uploader("Upload AB File (ab.xlsx)", type=["xlsx"], key="ab100")
-    ml_file = st.file_uploader("Upload ML File (ML.xlsx)", type=["xlsx"], key="ml100")
-    costs_file = st.file_uploader("Upload Costs File (Costs.xlsx)", type=["xlsx"], key="costs100")
+elif choice == "NC 100% Revenue":
+    st.header("NC 100% Revenue (Cloud-safe)")
 
-    if ab_file and ml_file and costs_file:
-        with open("ab.xlsx", "wb") as f: f.write(ab_file.getbuffer())
+    # Required uploads
+    ab_file = st.file_uploader("Upload AB File (ab.xlsx)", type=["xlsx"], key="abfile")
+    ml_file = st.file_uploader("Upload Mavenlink File (ML.xlsx)", type=["xlsx"], key="mlfile")
+    cost_file = st.file_uploader("Upload Costs File (Costs.xlsx)", type=["xlsx"], key="costfile")
 
-        df_ml = pd.read_excel(ml_file, sheet_name="Summary", header=2)
-        df_ml.columns = df_ml.columns.str.strip().str.lower()
-        st.write("📋 ML columns detected:", list(df_ml.columns))
+    st.markdown("**Optional Support Files (if not bundled in repo):**")
+    parts_up   = st.file_uploader("Parts.xlsx (optional)", type=["xlsx"], key="parts100")
+    revtype_up = st.file_uploader("revenue_type.xlsx (optional)", type=["xlsx"], key="revtype100")
+    gl_up      = st.file_uploader("lookup_gl.xlsx (optional)", type=["xlsx"], key="gl100")
 
-        special_action_col = next((c for c in df_ml.columns if "special" in c and "action" in c), None)
-        if special_action_col is None:
-            st.error("❌ Could not find a 'Special Action' column in the ML file.")
+    # Require core uploads
+    if not (ab_file and ml_file and cost_file):
+        st.info("Please upload AB, ML and Costs files to enable processing.")
+        st.stop()
+
+    # Resolve support files
+    try:
+        parts_src   = resolve_support_file(parts_up,   "Parts.xlsx")
+        revtype_src = resolve_support_file(revtype_up, "revenue_type.xlsx")
+        gl_src      = resolve_support_file(gl_up,      "lookup_gl.xlsx")
+    except FileNotFoundError as e:
+        st.error(f"{e}\n\nAdd the file to your GitHub repo (same folder as app.py) or upload it here.")
+        st.stop()
+
+    # Quick preview of ML sheet (Summary tab)
+    try:
+        df_ml = load_excel_df(ml_file, sheet_name="Summary", header=2)
+        st.write("ML columns detected:", list(df_ml.columns)[:12], "…")
+    except Exception as e:
+        st.warning(f"Could not preview ML file: {e}")
+
+    import os, sys, subprocess, shutil, tempfile, datetime
+
+    def timestamped_filename(base):
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        stem, ext = os.path.splitext(base)
+        return f"{stem}_{ts}{ext}"
+
+    if st.button("Run 100% Revenue Process"):
+        with st.spinner("Preparing inputs …"):
+            workdir = tempfile.mkdtemp(prefix="full_")
+
+            # Save core inputs with expected names
+            for src, name in [(ab_file,"ab.xlsx"),(ml_file,"ML.xlsx"),(cost_file,"Costs.xlsx")]:
+                with open(os.path.join(workdir, name), "wb") as f:
+                    f.write(src.getbuffer())
+
+            # Save/Copy support files
+            def _dump(src, dstname):
+                dst = os.path.join(workdir, dstname)
+                if isinstance(src, (pathlib.Path, str)):
+                    shutil.copy2(src, dst)
+                else:
+                    with open(dst, "wb") as f:
+                        f.write(src.getbuffer() if hasattr(src, "getbuffer") else src.read())
+            _dump(parts_src,   "Parts.xlsx")
+            _dump(revtype_src, "revenue_type.xlsx")
+            _dump(gl_src,      "lookup_gl.xlsx")
+
+        with st.spinner("Running nc100.py …"):
+            script_path = str(HERE / "nc100.py")
+            result = subprocess.run(
+                [sys.executable, script_path],
+                cwd=workdir, capture_output=True, text=True
+            )
+
+        st.subheader("Process logs")
+        st.code(result.stdout or "(no stdout)")
+        if result.stderr:
+            st.error(result.stderr)
+
+        produced = []
+        for name in ("Updated Revenue Report.xlsx",):
+            p = os.path.join(workdir, name)
+            if os.path.exists(p):
+                produced.append(p)
+
+        if not produced:
+            st.warning("No output file produced — check the logs above.")
         else:
-            df_ml[special_action_col] = df_ml[special_action_col].astype(str).str.strip()
-            cols_to_keep = KEEP_COLS + [special_action_col]
-            df_ml = df_ml[[c for c in cols_to_keep if c in df_ml.columns]]
-            df_ml = df_ml[df_ml[special_action_col].str.lower() == "full rec"]
-            st.subheader("Filtered ML Preview (first 20 rows)")
-            st.dataframe(df_ml.head(20))
-            df_ml.to_excel("ML.xlsx", index=False)
+            for p in produced:
+                ts_name = timestamped_filename(os.path.basename(p))
+                new_p = os.path.join(workdir, ts_name)
+                os.replace(p, new_p)
+                with open(new_p, "rb") as f:
+                    st.download_button(
+                        label=f"Download {ts_name}",
+                        data=f.read(),
+                        file_name=ts_name,
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True
+                    )
 
-        with open("Costs.xlsx", "wb") as f: f.write(costs_file.getbuffer())
 
-        st.header("NC 100% Revenue")
-        if st.button("Run 100% Revenue Process"):
-            with st.spinner("Running NC 100% Revenue... please wait"):
-                result = subprocess.run([sys.executable, "nc100.py"], capture_output=True, text=True)
-            st.code(result.stdout)
-            if result.stderr:
-                st.error(result.stderr)
-            else:
-                original_file = "Updated Revenue Report.xlsx"
-                if os.path.exists(original_file):
-                    ts_file = timestamped_filename(original_file)
-                    os.rename(original_file, ts_file)
-                    st.success(f"✅ Process completed! File saved: {ts_file}")
-                    with open(ts_file, "rb") as f:
-                        st.download_button("Download Final Report", f, file_name=ts_file,
-                                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    else:
-        st.info("Please upload AB, ML, and Costs files to enable processing.")
-
-# =========================
-# NC Partial Revenue (INDEPENDENT, ONLY 2 UPLOADS)
-# =========================
 elif choice == "NC Partial Revenue":
-    st.header("NC Partial Revenue (Independent – 2 uploads)")
+    st.header("NC Partial Revenue (Cloud-safe)")
 
-    # Upload only these two
+    # Only the two operational uploads are required for Partial
     pb_partial = st.file_uploader("Power BI Partial (powerbipartial.xlsx)", type=["xlsx"], key="pbpartial")
     ml_partial = st.file_uploader("Mavenlink Partial (MLPARTIAL.xlsx)", type=["xlsx"], key="mlpartial")
 
-    # Your shared subpath *relative to* each user’s OneDrive/Team Sites root
-    TEAM_SUBPATH = r"Documents\HRC- CC-Revenue\General\Month End Close\Nurse Call\python_app"
-    support_dir = find_support_dir(TEAM_SUBPATH)
+    st.markdown("**Optional (only if not bundled in repo):** Upload support files or the app will use the copies in the repo.")
+    parts_up   = st.file_uploader("Parts.xlsx (optional)", type=["xlsx"], key="parts")
+    revtype_up = st.file_uploader("revenue_type.xlsx (optional)", type=["xlsx"], key="revtype")
+    gl_up      = st.file_uploader("lookup_gl.xlsx (optional)", type=["xlsx"], key="gl")
 
-    # Manual override if auto-detect fails or you want to point elsewhere
-    manual = st.text_input(
-        "Support files folder (auto-detected if possible)",
-        value=str(support_dir) if support_dir else ""
-    ).strip()
-    if manual:
-        p = Path(manual)
-        if p.exists():
-            support_dir = p
+    # Gate: need the two operational files
+    if not (pb_partial and ml_partial):
+        st.info("Upload both Power BI Partial and MLPARTIAL to enable processing.")
+        st.stop()
 
-    # Save the two uploads to the exact filenames ncpartial.py expects
-    ready_uploads = True
-    if pb_partial:
-        with open("powerbipartial.xlsx", "wb") as f: f.write(pb_partial.getbuffer())
-    else:
-        ready_uploads = False
-    if ml_partial:
-        with open("MLPARTIAL.xlsx", "wb") as f: f.write(ml_partial.getbuffer())
-    else:
-        ready_uploads = False
+    # --- Resolve support files (upload > fallback to repo) ---
+    try:
+        parts_src   = resolve_support_file(parts_up,   "Parts.xlsx")
+        revtype_src = resolve_support_file(revtype_up, "revenue_type.xlsx")
+        gl_src      = resolve_support_file(gl_up,      "lookup_gl.xlsx")
+    except FileNotFoundError as e:
+        st.error(f"{e}\n\nAdd the file to your GitHub repo (same folder as app.py) or upload it here.")
+        st.stop()
 
-    # Copy support files from the detected/override folder
-    missing_support = []
-    if support_dir and support_dir.exists():
-        for fname in REQUIRED_SUPPORT:
-            src = support_dir / fname
-            dst = Path.cwd() / fname
-            if not src.exists():
-                missing_support.append(fname); continue
-            try:
-                if (not dst.exists()) or (src.stat().st_mtime > dst.stat().st_mtime):
+    # --- Preview (optional) ---
+    with st.expander("Preview detected inputs", expanded=False):
+        try:
+            st.write("Power BI columns:", list(load_excel_df(pb_partial).columns)[:12], "…")
+        except Exception as e:
+            st.warning(f"Could not preview Power BI file: {e}")
+        try:
+            st.write("ML columns:", list(load_excel_df(ml_partial, sheet_name="Summary", header=2).columns)[:12], "…")
+        except Exception as e:
+            st.warning(f"Could not preview ML file: {e}")
+
+    # --- Run ncpartial.py using local temp files in the cloud container ---
+    import os, sys, subprocess, shutil, tempfile, datetime
+
+    def timestamped_filename(base):
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        stem, ext = os.path.splitext(base)
+        return f"{stem}_{ts}{ext}"
+
+    if st.button("Run Partial Revenue Process"):
+        with st.spinner("Preparing inputs…"):
+            # Work in a temp dir to avoid collisions between sessions
+            workdir = tempfile.mkdtemp(prefix="partial_")
+            # Save the two required inputs with the exact names ncpartial.py expects
+            with open(os.path.join(workdir, "powerbipartial.xlsx"), "wb") as f:
+                f.write(pb_partial.getbuffer())
+            with open(os.path.join(workdir, "MLPARTIAL.xlsx"), "wb") as f:
+                f.write(ml_partial.getbuffer())
+            # Save/Copy the support files with expected names
+            def _dump(src, dstname):
+                dst = os.path.join(workdir, dstname)
+                if isinstance(src, (pathlib.Path, str)):
                     shutil.copy2(src, dst)
-            except Exception as e:
-                st.error(f"Copy failed for {fname}: {e}")
-    else:
-        st.warning("Support folder not found. Enter a valid path above.")
+                else:
+                    with open(dst, "wb") as f:
+                        f.write(src.getbuffer() if hasattr(src, "getbuffer") else src.read())
+                return dst
+            _dump(parts_src,   "Parts.xlsx")
+            _dump(revtype_src, "revenue_type.xlsx")
+            _dump(gl_src,      "lookup_gl.xlsx")
 
-    if missing_support:
-        st.warning("Missing in support folder: " + ", ".join(missing_support))
+        with st.spinner("Running ncpartial.py… this may take a moment"):
+            # Run ncpartial.py located next to app.py; set cwd to the temp workdir
+            script_path = str(HERE / "ncpartial.py")
+            result = subprocess.run(
+                [sys.executable, script_path],
+                cwd=workdir, capture_output=True, text=True
+            )
 
-    if not ready_uploads:
-        st.info("Upload both Excel files to enable the Partial process.")
-    elif missing_support:
-        st.info("Place the missing support files in the folder before running.")
-    else:
-        if st.button("Run Partial Revenue Process"):
-            with st.spinner("Running ncpartial.py... please wait"):
-                result = subprocess.run([sys.executable, "ncpartial.py"], capture_output=True, text=True)
-            st.code(result.stdout)
-            if result.stderr:
-                st.error(result.stderr)
-            for produced in ["partialrevenue.xlsx", "Updated_Partial_Revenue.xlsx"]:
-                if os.path.exists(produced):
-                    ts_file = timestamped_filename(produced)
-                    os.rename(produced, ts_file)
-                    st.success(f"✅ Created: {ts_file}")
-                    with open(ts_file, "rb") as f:
-                        st.download_button(f"Download {ts_file}", f, file_name=ts_file,
-                                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        st.subheader("Process logs")
+        st.code(result.stdout or "(no stdout)")
+        if result.stderr:
+            st.error(result.stderr)
+
+        # Offer any outputs the script produced
+        produced = []
+        for name in ("partialrevenue.xlsx", "Updated_Partial_Revenue.xlsx"):
+            p = os.path.join(workdir, name)
+            if os.path.exists(p):
+                produced.append(p)
+
+        if not produced:
+            st.warning("No output files were produced. Check the logs above for errors.")
+        else:
+            for p in produced:
+                ts_name = timestamped_filename(os.path.basename(p))
+                # Rename within temp dir (purely cosmetic)
+                new_p = os.path.join(workdir, ts_name)
+                os.replace(p, new_p)
+                with open(new_p, "rb") as f:
+                    st.download_button(
+                        label=f"Download {ts_name}",
+                        data=f.read(),
+                        file_name=ts_name,
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True
+                    )
