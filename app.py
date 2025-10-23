@@ -106,7 +106,7 @@ def timestamped_filename(base_name: str) -> str:
     name, ext = os.path.splitext(base_name)
     return f"{name}_{ts}{ext}"
 
-elif choice == "NC 100% Revenue":
+if choice == "NC 100% Revenue":
     st.header("NC 100% Revenue (Cloud-safe)")
 
     # Required uploads
